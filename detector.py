@@ -10,11 +10,26 @@ import numpy as np
 Point = Tuple[int, int]
 
 
-def preprocess_gray(frame: np.ndarray) -> np.ndarray:
+def preprocess_for_detection(frame: np.ndarray, target_gray_mean: float) -> np.ndarray:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    gray = cv2.equalizeHist(gray)
-    return gray
+    current_mean = float(np.mean(gray))
+    if current_mean > 1.0:
+        alpha = target_gray_mean / current_mean
+        alpha = max(0.6, min(1.6, alpha))
+        gray = cv2.convertScaleAbs(gray, alpha=alpha, beta=0)
+    blur = cv2.GaussianBlur(gray, (3, 3), 1)
+    threshold = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        25,
+        16,
+    )
+    median = cv2.medianBlur(threshold, 5)
+    kernel = np.ones((3, 3), np.uint8)
+    dilated = cv2.dilate(median, kernel, iterations=1)
+    return dilated
 
 
 def build_masks(shape: Tuple[int, int], slots: List[Dict[str, object]]) -> Dict[str, np.ndarray]:
@@ -59,15 +74,29 @@ def main() -> None:
         return
 
     detection_cfg = config.get("detection", {})
-    diff_threshold = int(detection_cfg.get("diff_threshold", 25))
-    change_ratio_threshold = float(detection_cfg.get("change_ratio_threshold", 0.12))
-    edge_ratio_threshold = float(detection_cfg.get("edge_ratio_threshold", 0.035))
-    object_area_ratio_threshold = float(detection_cfg.get("object_area_ratio_threshold", 0.08))
+    nonzero_ratio_threshold = float(
+        detection_cfg.get(
+            "nonzero_ratio_threshold",
+            detection_cfg.get("change_ratio_threshold", 0.175),
+        )
+    )
+    nonzero_delta_threshold = float(detection_cfg.get("nonzero_delta_threshold", 0.06))
 
-    empty_gray = preprocess_gray(empty_frame)
-    empty_edges = cv2.Canny(empty_gray, 50, 150)
+    empty_gray_mean = float(np.mean(cv2.cvtColor(empty_frame, cv2.COLOR_BGR2GRAY)))
+    empty_processed = preprocess_for_detection(empty_frame, empty_gray_mean)
 
-    masks = build_masks(empty_gray.shape, slots)
+    masks = build_masks(empty_frame.shape[:2], slots)
+    slot_baseline_ratios: Dict[str, float] = {}
+    for slot in slots:
+        label = str(slot["id"])
+        mask = masks[label]
+        area = int(cv2.countNonZero(mask))
+        if area == 0:
+            slot_baseline_ratios[label] = 0.0
+            continue
+        slot_empty_binary = cv2.bitwise_and(empty_processed, mask)
+        slot_baseline_ratios[label] = cv2.countNonZero(slot_empty_binary) / float(area)
+
     slot_histories: Dict[str, Deque[bool]] = {
         str(slot["id"]): deque(maxlen=5) for slot in slots
     }
@@ -87,9 +116,7 @@ def main() -> None:
         if frame.shape[:2] != empty_frame.shape[:2]:
             frame = cv2.resize(frame, (empty_frame.shape[1], empty_frame.shape[0]))
 
-        gray = preprocess_gray(frame)
-        edges = cv2.Canny(gray, 50, 150)
-        diff = cv2.absdiff(gray, empty_gray)
+        processed = preprocess_for_detection(frame, empty_gray_mean)
 
         open_slots: List[str] = []
         occupied_slots: List[str] = []
@@ -103,23 +130,12 @@ def main() -> None:
             if area == 0:
                 continue
 
-            # Color-invariant occupancy cues: intensity change, new edge content, and contiguous changed object size.
-            changed = cv2.bitwise_and((diff > diff_threshold).astype(np.uint8) * 255, mask)
-            changed = cv2.morphologyEx(changed, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-            changed = cv2.morphologyEx(changed, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-            changed_ratio = cv2.countNonZero(changed) / float(area)
-
-            edge_new = cv2.bitwise_and(cv2.bitwise_and(edges, cv2.bitwise_not(empty_edges)), mask)
-            edge_ratio = cv2.countNonZero(edge_new) / float(area)
-
-            contours, _ = cv2.findContours(changed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            max_object_area = max((cv2.contourArea(c) for c in contours), default=0.0)
-            object_area_ratio = max_object_area / float(area)
-
+            slot_binary = cv2.bitwise_and(processed, mask)
+            nonzero_ratio = cv2.countNonZero(slot_binary) / float(area)
+            baseline_ratio = slot_baseline_ratios.get(label, 0.0)
             occupied_raw = (
-                changed_ratio > change_ratio_threshold
-                or edge_ratio > edge_ratio_threshold
-                or object_area_ratio > object_area_ratio_threshold
+                nonzero_ratio > nonzero_ratio_threshold
+                and (nonzero_ratio - baseline_ratio) > nonzero_delta_threshold
             )
 
             slot_histories[label].append(occupied_raw)
