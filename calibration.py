@@ -1,284 +1,329 @@
-import argparse
-import json
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+"""
+calibration.py  –  Parking Space Calibration Tool
+===================================================
+Usage:
+    python calibration.py                  # webcam (index 0)
+    python calibration.py carPark.mp4      # video file (uses first frame)
+    python calibration.py carParkImg.png   # static image
+
+Controls (in the OpenCV window):
+    L-CLICK          → place a zone at cursor using current default size
+    L-DRAG           → draw a custom-size zone
+    R-CLICK          → delete the zone under cursor
+    S                → save calibration to parking_config.pkl
+    C                → clear ALL zones
+    U                → undo last placed zone
+    Q / ESC          → quit (unsaved changes are lost)
+
+Trackbars:
+    Sensitivity      → pixel-count threshold (above = occupied)
+    Default W / H    → size used for single-click placement
+    Rows             → number of row labels  (a, b, c …)
+    Cols             → number of column labels (1, 2, 3 …)
+
+Zones are auto-named in row-major order (a1, a2 … b1, b2 …).
+The first unplaced name is shown as "Next →" in the HUD.
+"""
 
 import cv2
+import pickle
 import numpy as np
+import sys
+import os
 
-Point = Tuple[int, int]
-Polygon = List[Point]
+# ─────────────────────────────────────────────────────────────────────────────
+CONFIG_FILE   = "parking_config.pkl"
+WIN_NAME      = "Parking Space Calibration"
+
+# Overlay panel geometry
+PANEL_W       = 240   # right-side info strip (pixels)
+HUD_H         = 110   # bottom control-hint strip (pixels)
+
+# Colours
+C_FREE        = (0,   255,  0  )
+C_OCC         = (0,   0,   255 )
+C_ZONE        = (255, 0,   255 )
+C_DRAG        = (0,   255, 255 )
+C_HOVER       = (0,   200, 255 )
+C_TEXT_YEL    = (0,   255, 255 )
+C_TEXT_WHT    = (220, 220, 220 )
+C_PANEL_BG    = (25,  25,  25  )
+C_ACCENT      = (100, 180, 255 )
 
 
-class CalibrationUI:
-    def __init__(self, frame: np.ndarray, slot_labels: List[str]) -> None:
-        self.frame = frame
-        self.slot_labels = slot_labels
-        self.slots: Dict[str, Polygon] = {label: [] for label in slot_labels}
-        self.current_index = 0
-        self.mode = "draw"
-        self.drag_target: Optional[Tuple[str, int]] = None
+# ─────────────────────────────────────────────────────────────────────────────
+def load_config() -> dict:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"[WARN] Could not load config: {e}")
+    return dict(spaces={}, sensitivity=900, rows=2, cols=3,
+                default_w=107, default_h=48)
 
-    @property
-    def current_label(self) -> Optional[str]:
-        if self.current_index >= len(self.slot_labels):
-            return None
-        return self.slot_labels[self.current_index]
 
-    def all_complete(self) -> bool:
-        return all(len(points) == 4 for points in self.slots.values())
+def save_config(cfg: dict):
+    with open(CONFIG_FILE, "wb") as f:
+        pickle.dump(cfg, f)
+    print(f"[SAVED] {len(cfg['spaces'])} spaces → {CONFIG_FILE}")
 
-    def find_nearest_vertex(self, x: int, y: int, radius: int = 14) -> Optional[Tuple[str, int]]:
-        closest: Optional[Tuple[str, int]] = None
-        best_dist_sq = radius * radius
 
-        for label, points in self.slots.items():
-            for idx, point in enumerate(points):
-                dx = point[0] - x
-                dy = point[1] - y
-                dist_sq = dx * dx + dy * dy
-                if dist_sq <= best_dist_sq:
-                    best_dist_sq = dist_sq
-                    closest = (label, idx)
-        return closest
+def gen_names(rows: int, cols: int) -> list[str]:
+    """Generate ['a1','a2','b1','b2', …] for the given grid dimensions."""
+    return [
+        f"{chr(ord('a') + r)}{c}"
+        for r in range(rows)
+        for c in range(1, cols + 1)
+    ]
 
-    def on_mouse(self, event: int, x: int, y: int, flags: int, param: object) -> None:
-        if self.mode == "draw":
-            if event == cv2.EVENT_LBUTTONDOWN and self.current_label is not None:
-                points = self.slots[self.current_label]
-                if len(points) < 4:
-                    points.append((x, y))
-                if len(points) == 4:
-                    self.current_index += 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+class CalibrationApp:
+    def __init__(self, source):
+        cfg = load_config()
+        self.spaces      : dict[str, tuple] = cfg.get("spaces", {})
+        self.sensitivity : int  = cfg.get("sensitivity", 900)
+        self.rows        : int  = cfg.get("rows", 2)
+        self.cols        : int  = cfg.get("cols", 3)
+        self.def_w       : int  = cfg.get("default_w", 107)
+        self.def_h       : int  = cfg.get("default_h", 48)
+
+        self.names       : list[str] = gen_names(self.rows, self.cols)
+        self.history     : list      = []   # undo stack (list of name strings)
+
+        # Mouse state
+        self.mx = self.my = 0
+        self.drawing    = False
+        self.drag_start = None
+        self.drag_end   = None
+
+        # Source
+        self.cap        = None
+        self.static     = None
+        self._open_source(source)
+        self._read_first_frame()
+
+        # Window
+        cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(WIN_NAME, self._mouse_cb)
+        self._create_trackbars()
+
+    # ── source helpers ────────────────────────────────────────────────────────
+    def _open_source(self, source):
+        try:
+            idx = int(source)
+            self.cap = cv2.VideoCapture(idx)
             return
+        except (ValueError, TypeError):
+            pass
+        img = cv2.imread(str(source))
+        if img is not None:
+            self.static = img
+            return
+        self.cap = cv2.VideoCapture(str(source))
 
-        # Edit mode: drag any existing point.
+    def _read_first_frame(self):
+        if self.cap and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if ret:
+                self.static = frame.copy()   # freeze first frame for overlay
+
+    def _get_frame(self) -> np.ndarray | None:
+        if self.cap and self.cap.isOpened():
+            ret, f = self.cap.read()
+            if not ret:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, f = self.cap.read()
+            return f if ret else self.static
+        return self.static.copy() if self.static is not None else None
+
+    def _create_trackbars(self):
+        cv2.createTrackbar("Sensitivity",  WIN_NAME, self.sensitivity, 5000, self._tb_sens)
+        cv2.createTrackbar("Default W",    WIN_NAME, self.def_w,       400,  self._tb_dw)
+        cv2.createTrackbar("Default H",    WIN_NAME, self.def_h,       300,  self._tb_dh)
+        cv2.createTrackbar("Rows",         WIN_NAME, self.rows,        15,   self._tb_rows)
+        cv2.createTrackbar("Cols",         WIN_NAME, self.cols,        20,   self._tb_cols)
+
+    def _tb_sens(self, v): self.sensitivity = max(1, v)
+    def _tb_dw  (self, v): self.def_w       = max(10, v)
+    def _tb_dh  (self, v): self.def_h       = max(10, v)
+
+    def _tb_rows(self, v):
+        self.rows  = max(1, v)
+        self.names = gen_names(self.rows, self.cols)
+
+    def _tb_cols(self, v):
+        self.cols  = max(1, v)
+        self.names = gen_names(self.rows, self.cols)
+
+    def _mouse_cb(self, event, x, y, flags, param):
+        self.mx, self.my = x, y
+
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.drag_target = self.find_nearest_vertex(x, y)
-        elif event == cv2.EVENT_MOUSEMOVE and self.drag_target is not None:
-            label, point_idx = self.drag_target
-            self.slots[label][point_idx] = (x, y)
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.drag_target = None
+            self.drawing    = True
+            self.drag_start = (x, y)
+            self.drag_end   = (x, y)
 
-    def draw_overlay(self) -> np.ndarray:
-        canvas = self.frame.copy()
+        elif event == cv2.EVENT_MOUSEMOVE and self.drawing:
+            self.drag_end = (x, y)
 
-        for label in self.slot_labels:
-            points = self.slots[label]
-            color = (70, 200, 70) if len(points) == 4 else (50, 180, 220)
+        elif event == cv2.EVENT_LBUTTONUP and self.drawing:
+            self.drawing = False
+            if self.drag_start is None:
+                return
+            x0, y0 = self.drag_start
+            x1, y1 = x, y
+            dx, dy = abs(x1 - x0), abs(y1 - y0)
 
-            if points:
-                for idx, point in enumerate(points):
-                    cv2.circle(canvas, point, 5, color, -1)
-                    cv2.putText(
-                        canvas,
-                        str(idx + 1),
-                        (point[0] + 7, point[1] - 7),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        color,
-                        1,
-                        cv2.LINE_AA,
-                    )
+            if dx < 6 and dy < 6:          # treat as single click
+                rx, ry = x0, y0
+                rw, rh = self.def_w, self.def_h
+            else:
+                rx = min(x0, x1)
+                ry = min(y0, y1)
+                rw, rh = max(dx, 10), max(dy, 10)
 
-            if len(points) >= 2:
-                for i in range(len(points) - 1):
-                    cv2.line(canvas, points[i], points[i + 1], color, 2)
+            used = set(self.spaces.keys())
+            for name in self.names:
+                if name not in used:
+                    self.spaces[name] = (rx, ry, rw, rh)
+                    self.history.append(name)
+                    break
+            else:
+                print("[INFO] All grid spaces are already placed.")
 
-            if len(points) == 4:
-                cv2.line(canvas, points[-1], points[0], color, 2)
-                poly = np.array(points, dtype=np.int32)
-                center = tuple(np.mean(poly, axis=0).astype(int))
-                cv2.putText(
-                    canvas,
-                    label,
-                    center,
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
+            self.drag_start = self.drag_end = None
 
-        mode_text = f"Mode: {self.mode.upper()}"
-        progress = sum(1 for p in self.slots.values() if len(p) == 4)
-        progress_text = f"Progress: {progress}/{len(self.slot_labels)} slots"
-        current_text = f"Current: {self.current_label if self.current_label else 'done'}"
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # Delete zone under cursor
+            for name, (sx, sy, sw, sh) in list(self.spaces.items()):
+                if sx <= x <= sx + sw and sy <= y <= sy + sh:
+                    del self.spaces[name]
+                    if name in self.history:
+                        self.history.remove(name)
+                    break
 
-        cv2.putText(canvas, mode_text, (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 30, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, progress_text, (15, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, current_text, (15, 79), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+    # ── drawing helpers ───────────────────────────────────────────────────────
+    def _draw_zones(self, frame: np.ndarray):
+        for name, (sx, sy, sw, sh) in self.spaces.items():
+            hover = sx <= self.mx <= sx + sw and sy <= self.my <= sy + sh
+            color = C_HOVER if hover else C_ZONE
+            thick = 3 if hover else 2
+            cv2.rectangle(frame, (sx, sy), (sx + sw, sy + sh), color, thick)
+            cv2.putText(frame, name.upper(),
+                        (sx + 3, sy + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, C_TEXT_YEL, 1, cv2.LINE_AA)
 
-        hint_lines = [
-            "DRAW: Click 4 points per slot (clockwise or counterclockwise)",
-            "TAB: toggle draw/edit, U: undo current slot point, R: reset current slot",
-            "EDIT: drag a corner point to refine slot polygon",
-            "S: save config, Q: quit",
-        ]
-        y = canvas.shape[0] - 85
-        for line in hint_lines:
-            cv2.putText(canvas, line, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (235, 235, 235), 1, cv2.LINE_AA)
-            y += 22
+        # Live drag rectangle
+        if self.drawing and self.drag_start and self.drag_end:
+            cv2.rectangle(frame, self.drag_start, self.drag_end, C_DRAG, 2)
 
-        return canvas
+    def _draw_right_panel(self, frame: np.ndarray) -> np.ndarray:
+        h = frame.shape[0]
+        panel = np.full((h, PANEL_W, 3), C_PANEL_BG, dtype=np.uint8)
 
+        def txt(s, y, color=C_TEXT_WHT, scale=0.45, thick=1):
+            cv2.putText(panel, s, (8, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, color, thick, cv2.LINE_AA)
 
-def excel_col_name(index: int) -> str:
-    # 0 -> a, 25 -> z, 26 -> aa
-    name = ""
-    value = index
-    while True:
-        value, rem = divmod(value, 26)
-        name = chr(ord("a") + rem) + name
-        if value == 0:
-            break
-        value -= 1
-    return name
+        txt("CALIBRATION", 24, C_ACCENT, 0.65, 2)
+        txt(f"Grid  {self.rows}R x {self.cols}C", 50, C_TEXT_WHT)
+        txt(f"Sens  {self.sensitivity}", 70, C_TEXT_WHT)
+        txt(f"Size  {self.def_w} x {self.def_h}", 90, C_TEXT_WHT)
 
+        # Divider
+        cv2.line(panel, (0, 102), (PANEL_W, 102), (60, 60, 60), 1)
 
-def build_slot_labels(rows: int, cols: int) -> List[str]:
-    labels: List[str] = []
-    for c in range(cols):
-        col_name = excel_col_name(c)
-        for r in range(1, rows + 1):
-            labels.append(f"{col_name}{r}")
-    return labels
+        # Space list
+        txt("SPACES", 122, C_ACCENT, 0.5, 1)
+        row_y = 145
+        for name in self.names:
+            if name in self.spaces:
+                sx, sy, sw, sh = self.spaces[name]
+                label = f"{name.upper()}  ({sx},{sy}) {sw}x{sh}"
+                color = (140, 240, 140)
+            else:
+                label = f"{name.upper()}  --"
+                color = (100, 100, 100)
+            txt(label, row_y, color)
+            row_y += 18
+            if row_y > h - 10:
+                break
 
+        return np.hstack([frame, panel])
 
-def capture_frame(camera_index: int) -> Optional[np.ndarray]:
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        return None
+    def _draw_hud(self, canvas: np.ndarray) -> np.ndarray:
+        ch, cw = canvas.shape[:2]
+        strip  = np.full((HUD_H, cw, 3), C_PANEL_BG, dtype=np.uint8)
 
-    captured_frame: Optional[np.ndarray] = None
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+        placed   = len(self.spaces)
+        total    = len(self.names)
+        unplaced = [n for n in self.names if n not in self.spaces]
+        nxt      = unplaced[0].upper() if unplaced else "ALL PLACED ✓"
 
-        display = frame.copy()
-        cv2.putText(
-            display,
-            "Press C to capture empty parking frame, Q to quit",
-            (15, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.imshow("Capture Empty Parking", display)
+        def row(s, y, color=C_TEXT_WHT):
+            cv2.putText(strip, s, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.48, color, 1, cv2.LINE_AA)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("c"):
-            captured_frame = frame.copy()
-            break
-        if key == ord("q"):
-            break
+        row(f"Placed: {placed}/{total}   Next → {nxt}", 24, C_ACCENT)
+        remaining = ", ".join(n.upper() for n in unplaced[:12])
+        if len(unplaced) > 12:
+            remaining += " …"
+        row(f"Remaining: {remaining}", 46, (160, 160, 160))
+        row("[L-CLICK] Place default   [L-DRAG] Draw custom   [R-CLICK] Delete", 70, C_TEXT_WHT)
+        row("[S] Save   [C] Clear all   [U] Undo   [Q/ESC] Quit", 92, C_TEXT_WHT)
 
-    cap.release()
-    cv2.destroyWindow("Capture Empty Parking")
-    return captured_frame
+        return np.vstack([canvas, strip])
 
+    # ── main loop ─────────────────────────────────────────────────────────────
+    def run(self):
+        print(f"[READY] {len(self.spaces)} spaces loaded. "
+              f"Grid: {self.rows}R x {self.cols}C")
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Parking slot calibration tool")
-    parser.add_argument("--output", default="parking_calibration.json", help="Output calibration JSON file")
-    parser.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
-    parser.add_argument(
-        "--empty-frame",
-        default="calibration_empty.png",
-        help="Path to save the reference empty parking image",
-    )
-    args = parser.parse_args()
+        while True:
+            frame = self._get_frame()
+            if frame is None:
+                print("[ERROR] Cannot read frame.")
+                break
 
-    try:
-        rows = int(input("How many rows? (1,2,3...): ").strip())
-        cols = int(input("How many columns? (1,2,3...): ").strip())
-    except ValueError:
-        print("Rows/columns must be integers.")
-        return
+            self._draw_zones(frame)
+            canvas = self._draw_right_panel(frame)
+            canvas = self._draw_hud(canvas)
+            cv2.imshow(WIN_NAME, canvas)
 
-    if rows <= 0 or cols <= 0:
-        print("Rows/columns must be > 0.")
-        return
+            key = cv2.waitKey(30) & 0xFF
 
-    frame = capture_frame(args.camera)
-    if frame is None:
-        print(f"Could not open webcam index: {args.camera}")
-        return
+            if key == ord("s"):
+                save_config(dict(
+                    spaces=self.spaces,
+                    sensitivity=self.sensitivity,
+                    rows=self.rows,
+                    cols=self.cols,
+                    default_w=self.def_w,
+                    default_h=self.def_h,
+                ))
 
-    slot_labels = build_slot_labels(rows, cols)
-    print("Slot labels:", ", ".join(slot_labels))
+            elif key == ord("c"):
+                self.spaces.clear()
+                self.history.clear()
+                print("[CLEARED] All spaces removed.")
 
-    ui = CalibrationUI(frame, slot_labels)
+            elif key == ord("u"):
+                if self.history:
+                    last = self.history.pop()
+                    self.spaces.pop(last, None)
+                    print(f"[UNDO] Removed {last.upper()}")
 
-    window = "Parking Calibration"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window, ui.on_mouse)
+            elif key in (ord("q"), 27):   # Q or ESC
+                break
 
-    while True:
-        canvas = ui.draw_overlay()
-        cv2.imshow(window, canvas)
-
-        key = cv2.waitKey(20) & 0xFF
-        if key == ord("\t"):
-            ui.mode = "edit" if ui.mode == "draw" else "draw"
-        elif key == ord("u") and ui.current_label is not None:
-            if ui.slots[ui.current_label]:
-                ui.slots[ui.current_label].pop()
-        elif key == ord("r") and ui.current_label is not None:
-            ui.slots[ui.current_label] = []
-        elif key == ord("s"):
-            if not ui.all_complete():
-                print("Please define all slot polygons (4 points each) before saving.")
-                continue
-            break
-        elif key == ord("q"):
-            cv2.destroyAllWindows()
-            print("Calibration canceled.")
-            return
-
-    cv2.destroyAllWindows()
-
-    output_path = Path(args.output)
-    empty_frame_path = Path(args.empty_frame)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    empty_frame_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not cv2.imwrite(str(empty_frame_path), frame):
-        print(f"Failed to write empty frame image: {empty_frame_path}")
-        return
-
-    config = {
-        "version": 1,
-        "rows": rows,
-        "cols": cols,
-        "slot_labels": slot_labels,
-        "empty_frame": str(empty_frame_path),
-        "detection": {
-            "diff_threshold": 25,
-            "change_ratio_threshold": 0.12,
-            "edge_ratio_threshold": 0.035,
-            "object_area_ratio_threshold": 0.08,
-        },
-        "slots": [
-            {
-                "id": label,
-                "polygon": [[int(x), int(y)] for x, y in ui.slots[label]],
-            }
-            for label in slot_labels
-        ],
-    }
-
-    with output_path.open("w", encoding="utf-8") as file:
-        json.dump(config, file, indent=2)
-
-    print(f"Saved calibration config to: {output_path}")
-    print(f"Saved empty reference frame to: {empty_frame_path}")
+        if self.cap:
+            self.cap.release()
+        cv2.destroyAllWindows()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    source = sys.argv[1] if len(sys.argv) > 1 else 0
+    CalibrationApp(source).run()
