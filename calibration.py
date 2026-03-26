@@ -323,7 +323,6 @@ class CalibrationApp:
         cv2.destroyAllWindows()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     source = sys.argv[1] if len(sys.argv) > 1 else 0
     CalibrationApp(source).run()
